@@ -1,0 +1,309 @@
+# =============================================================================
+# Reusable Workflow: lint.yml
+# Repository: ionrift-gm/ionrift-ci
+# Called as:  ionrift-gm/ionrift-ci/.github/workflows/lint.yml@main
+#
+# Covers: ESLint, Inclusion Terminology Scan, Import Integrity,
+#         Case-Sensitivity Check, and Signal Check.
+#
+# Jobs run in parallel. Consumers set `needs: [lint]` to gate on all passing.
+# Jobs flagged with skip_* inputs are skipped (not failed) for compiled modules.
+# =============================================================================
+name: Lint & Static Analysis
+
+on:
+  workflow_call:
+    inputs:
+
+      # ── ESLint ──────────────────────────────────────────────────────────────
+
+      skip_eslint:
+        description: 'Skip ESLint entirely (e.g. Resonance — compiled scripts)'
+        type: boolean
+        default: false
+      eslint_version:
+        description: 'ESLint npm version to install ("8" or "9")'
+        type: string
+        default: '8'
+      eslint_pattern:
+        description: 'Files or glob passed to eslint. Quote globs: "\"scripts/**/*.mjs\""'
+        type: string
+        default: 'scripts/'
+      eslint_ext_args:
+        description: '--ext flag for ESLint. Leave empty when using a glob pattern.'
+        type: string
+        default: '--ext .js'
+      eslint_max_warnings:
+        description: 'Max ESLint warnings before failure'
+        type: number
+        default: 50
+      eslint_extra_args:
+        description: 'Any additional ESLint flags (e.g. "--ignore-pattern scripts/vendor/**")'
+        type: string
+        default: ''
+
+      # ── Inclusion Scan ──────────────────────────────────────────────────────
+
+      script_ext:
+        description: 'Script file extension — drives inclusion + import checks (.js or .mjs)'
+        type: string
+        default: '.js'
+      include_html:
+        description: 'Also scan *.html files in the inclusion check'
+        type: boolean
+        default: true
+      include_styles:
+        description: 'Also scan *.css files (use for ionrift-library which has styles/)'
+        type: boolean
+        default: false
+      inclusion_scan_dirs:
+        description: 'Space-separated dirs for the inclusion scan (e.g. "scripts/ lang/")'
+        type: string
+        default: 'scripts/ lang/'
+
+      # ── Import Integrity & Case-Sensitivity ─────────────────────────────────
+
+      skip_import_integrity:
+        description: 'Skip import integrity check (compiled modules)'
+        type: boolean
+        default: false
+      skip_case_sensitivity:
+        description: 'Skip case-sensitivity check (compiled modules)'
+        type: boolean
+        default: false
+
+      # ── Signal Check ────────────────────────────────────────────────────────
+
+      signal_check_required:
+        description: 'Fail if tools/signal_check.js is absent. Set false for library (optional guard).'
+        type: boolean
+        default: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — ESLint
+  # Catches syntax errors, undeclared vars, and style violations.
+  # ─────────────────────────────────────────────────────────────────────────────
+  eslint:
+    name: ESLint
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_eslint }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ESLint
+        run: npm install --no-save eslint@${{ inputs.eslint_version }}
+
+      - name: Run ESLint
+        env:
+          ESLINT_USE_FLAT_CONFIG: 'false'
+        run: |
+          npx eslint ${{ inputs.eslint_pattern }} \
+            ${{ inputs.eslint_ext_args }} \
+            ${{ inputs.eslint_extra_args }} \
+            --config .eslintrc.json \
+            --max-warnings ${{ inputs.eslint_max_warnings }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Inclusion Terminology Scan
+  # Rejects prohibited identity terminology (Male, Female, Sex, Gender).
+  # Permitted replacements: Masculine, Feminine, Identity.
+  # ─────────────────────────────────────────────────────────────────────────────
+  inclusion-scan:
+    name: Inclusion Terminology Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan for prohibited terms
+        run: |
+          grep_args=()
+          grep_args+=(--include="*${{ inputs.script_ext }}")
+          if [[ "${{ inputs.include_html }}" == "true" ]]; then
+            grep_args+=(--include="*.html")
+          fi
+          if [[ "${{ inputs.include_styles }}" == "true" ]]; then
+            grep_args+=(--include="*.css")
+          fi
+
+          MATCHES=$(grep -rn "${grep_args[@]}" \
+            -E '\b(Male|Female|Sex|Gender)\b' \
+            ${{ inputs.inclusion_scan_dirs }} 2>/dev/null || true)
+
+          if [ -n "$MATCHES" ]; then
+            echo "❌ Prohibited identity terminology detected:"
+            echo "$MATCHES"
+            echo ""
+            echo "Use: Masculine / Feminine / Identity"
+            exit 1
+          fi
+          echo "✅ Inclusion scan passed."
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Import Integrity Check
+  # Detects broken relative imports (files referenced in JS that do not exist).
+  # ─────────────────────────────────────────────────────────────────────────────
+  import-integrity:
+    name: Import Integrity Check
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_import_integrity }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check relative imports resolve
+        env:
+          SCRIPT_EXT: ${{ inputs.script_ext }}
+        run: |
+          node << 'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const ROOT = path.resolve('scripts');
+          const ext = process.env.SCRIPT_EXT || '.js';
+          const importRe = /(?:import|from)\s+['"](\.[^'"]+)['"]/g;
+          let failed = false;
+
+          function sourceWithoutLineComments(src) {
+            return src.split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
+          }
+
+          function collectImports(src) {
+            const out = []; let m;
+            importRe.lastIndex = 0;
+            while ((m = importRe.exec(src)) !== null) out.push(m[1]);
+            return out;
+          }
+
+          function check(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) { check(full); continue; }
+              if (!entry.name.endsWith(ext)) continue;
+              const src = sourceWithoutLineComments(fs.readFileSync(full, 'utf8'));
+              for (const imp of collectImports(src)) {
+                const resolved = path.resolve(path.dirname(full), imp);
+                const candidates = [resolved, resolved + ext, resolved + '.js'];
+                if (!candidates.some(c => fs.existsSync(c))) {
+                  console.error('❌ Broken import in ' + path.relative(ROOT, full) + ': ' + imp);
+                  failed = true;
+                }
+              }
+            }
+          }
+
+          if (!fs.existsSync(ROOT)) { console.error('❌ scripts/ directory missing'); process.exit(1); }
+          check(ROOT);
+          if (failed) process.exit(1);
+          console.log('✅ Import integrity passed.');
+          NODE
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4 — Case-Sensitivity Check
+  # Catches imports that differ only in case: break on Linux CI, silent on Windows.
+  # ─────────────────────────────────────────────────────────────────────────────
+  case-sensitivity:
+    name: Case-Sensitivity Check
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_case_sensitivity }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build lowercase file manifest and check imports
+        env:
+          SCRIPT_EXT: ${{ inputs.script_ext }}
+        run: |
+          node << 'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const ROOT = path.resolve('scripts');
+          const ext = process.env.SCRIPT_EXT || '.js';
+          const importRe = /(?:import|from)\s+['"](\.[^'"]+)['"]/g;
+          let failed = false;
+
+          const manifest = new Map();
+          function index(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) { index(full); continue; }
+              manifest.set(full.toLowerCase(), full);
+            }
+          }
+
+          function collectImports(src) {
+            const out = []; let m;
+            importRe.lastIndex = 0;
+            while ((m = importRe.exec(src)) !== null) out.push(m[1]);
+            return out;
+          }
+
+          function check(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) { check(full); continue; }
+              if (!entry.name.endsWith(ext)) continue;
+              const src = fs.readFileSync(full, 'utf8');
+              for (const imp of collectImports(src)) {
+                let resolved = path.resolve(path.dirname(full), imp);
+                if (!resolved.endsWith(ext)) resolved += ext;
+                const real = manifest.get(resolved.toLowerCase());
+                if (real && real !== resolved) {
+                  console.error('❌ Case mismatch in ' + path.relative(ROOT, full) + ': imported as ' + imp + ' but real path is ' + path.relative(ROOT, real));
+                  failed = true;
+                }
+              }
+            }
+          }
+
+          if (!fs.existsSync(ROOT)) { console.error('❌ scripts/ directory missing'); process.exit(1); }
+          index(ROOT);
+          check(ROOT);
+          if (failed) process.exit(1);
+          console.log('✅ Case-sensitivity check passed.');
+          NODE
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 5 — Signal Check
+  # Runs tools/signal_check.js against scripts/. Catches AI-tone violations.
+  # Authoring source: ionrift-devtools/scripts/. Copy here when patterns change.
+  # ─────────────────────────────────────────────────────────────────────────────
+  signal-check:
+    name: Signal Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run signal check
+        run: |
+          if [[ -f tools/signal_check.js ]]; then
+            node tools/signal_check.js scripts/
+          elif [[ "${{ inputs.signal_check_required }}" == "true" ]]; then
+            echo "❌ tools/signal_check.js not found. Copy from ionrift-devtools."
+            exit 1
+          else
+            echo "⚠️ tools/signal_check.js absent — skipping signal check."
+          fi

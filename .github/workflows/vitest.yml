@@ -1,0 +1,41 @@
+# =============================================================================
+# Reusable Workflow: vitest.yml
+# Repository: ionrift-gm/ionrift-ci
+# Called as:  ionrift-gm/ionrift-ci/.github/workflows/vitest.yml@main
+#
+# Covers: Headless Vitest unit tests. No Foundry runtime required.
+# Used by: ionrift-library, ionrift-respite, ionrift-arbiter, ionrift-workshop.
+# Not used by: ionrift-resonance (compiled scripts, no Vitest suite).
+# =============================================================================
+name: Unit Tests (Vitest)
+
+on:
+  workflow_call:
+    inputs:
+      vitest_command:
+        description: 'Command to run Vitest (default: npm test)'
+        type: string
+        default: 'npm test'
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Unit Tests (Vitest)
+  # ─────────────────────────────────────────────────────────────────────────────
+  vitest:
+    name: Unit Tests (Vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Vitest
+        run: ${{ inputs.vitest_command }}

@@ -1,0 +1,46 @@
+# =============================================================================
+# Reusable Workflow: module-manifest.yml
+# Repository: ionrift-gm/ionrift-ci
+# Called as:  ionrift-gm/ionrift-ci/.github/workflows/module-manifest.yml@main
+#
+# Validates that module.json is valid JSON and contains the required fields:
+# id, title, version — all non-empty strings.
+# Used by: ionrift-library (the only module that needs this in CI for now).
+# =============================================================================
+name: Module Manifest Check
+
+on:
+  workflow_call:
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Module Manifest Check
+  # ─────────────────────────────────────────────────────────────────────────────
+  module-manifest:
+    name: Module Manifest Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate module.json
+        run: |
+          node << 'NODE'
+          const fs = require('fs');
+          const raw = fs.readFileSync('module.json', 'utf8');
+          let data;
+          try {
+            data = JSON.parse(raw);
+          } catch (e) {
+            console.error('❌ Invalid module.json:', e.message);
+            process.exit(1);
+          }
+          for (const key of ['id', 'title', 'version']) {
+            if (!data[key] || typeof data[key] !== 'string') {
+              console.error('❌ Missing or invalid string field:', key);
+              process.exit(1);
+            }
+          }
+          console.log('✅ Module manifest OK —', data.id, 'v' + data.version);
+          NODE

@@ -1,0 +1,56 @@
+# =============================================================================
+# Reusable Workflow: hygiene.yml
+# Repository: ionrift-gm/ionrift-ci
+# Called as:  ionrift-gm/ionrift-ci/.github/workflows/hygiene.yml@main
+#
+# Covers: Artifact Hygiene Gate — dev docs, dev tooling, LevelDB runtime files.
+# Identical across all Ionrift modules. No inputs required.
+# Translates RELEASE_PROCESS.md §3.2 manual sweep into a CI gate.
+# =============================================================================
+name: Artifact Hygiene Gate
+
+on:
+  workflow_call:
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Artifact Hygiene Gate
+  # Three sweeps: dev docs, dev tooling, LevelDB runtime files.
+  # ─────────────────────────────────────────────────────────────────────────────
+  artifact-hygiene:
+    name: Artifact Hygiene Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dev document sweep
+        run: |
+          MATCHES=$(git ls-files | grep -iE "BACKLOG|DESIGN|CHECKLIST|CONTENT_GUIDE|scenarios/" || true)
+          if [ -n "$MATCHES" ]; then
+            echo "❌ Dev documents found in tracked files:"
+            echo "$MATCHES"
+            exit 1
+          fi
+          echo "✅ Dev document sweep passed."
+
+      - name: Dev tooling sweep
+        run: |
+          MATCHES=$(git ls-files | grep -iE "scripts/tests/|scripts/utils/|dev-link|compendiumBuilder" || true)
+          if [ -n "$MATCHES" ]; then
+            echo "❌ Dev tooling found in tracked files:"
+            echo "$MATCHES"
+            exit 1
+          fi
+          echo "✅ Dev tooling sweep passed."
+
+      - name: LevelDB runtime sweep
+        run: |
+          MATCHES=$(git ls-files | grep -iE "packs/.*\.(LOCK|LOG|LOG\.old|log)$" || true)
+          if [ -n "$MATCHES" ]; then
+            echo "❌ LevelDB runtime files found in tracked files:"
+            echo "$MATCHES"
+            exit 1
+          fi
+          echo "✅ LevelDB sweep passed."

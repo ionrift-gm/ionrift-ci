@@ -1,0 +1,183 @@
+# =============================================================================
+# Reusable Workflow: pre-release.yml
+# Repository: ionrift-gm/ionrift-ci
+# Called as:  ionrift-gm/ionrift-ci/.github/workflows/pre-release.yml@main
+#
+# Pre-Release Gate: composes lint, hygiene, vitest, and module-manifest into
+# a single workflow. GM triggers manually (workflow_dispatch) before tagging.
+# If all gates pass, safe to tag.
+# Outputs a markdown summary artifact listing each gate with pass/fail.
+# =============================================================================
+name: Reusable Pre-Release Gate
+
+on:
+  workflow_call:
+    inputs:
+
+      # ── Lint pass-through (see lint.yml for full descriptions) ─────────────
+
+      skip_eslint:
+        description: 'Skip ESLint entirely (compiled modules)'
+        type: boolean
+        default: false
+      eslint_version:
+        description: 'ESLint npm version ("8" or "9")'
+        type: string
+        default: '8'
+      eslint_pattern:
+        description: 'Files or glob passed to eslint'
+        type: string
+        default: 'scripts/'
+      eslint_ext_args:
+        description: '--ext flag for ESLint'
+        type: string
+        default: '--ext .js'
+      eslint_max_warnings:
+        description: 'Max ESLint warnings before failure'
+        type: number
+        default: 50
+      eslint_extra_args:
+        description: 'Additional ESLint flags'
+        type: string
+        default: ''
+      script_ext:
+        description: 'Script file extension (.js or .mjs)'
+        type: string
+        default: '.js'
+      include_html:
+        description: 'Scan *.html in inclusion check'
+        type: boolean
+        default: true
+      include_styles:
+        description: 'Scan *.css in inclusion check'
+        type: boolean
+        default: false
+      inclusion_scan_dirs:
+        description: 'Space-separated dirs for inclusion scan'
+        type: string
+        default: 'scripts/ lang/'
+      skip_import_integrity:
+        description: 'Skip import integrity check'
+        type: boolean
+        default: false
+      skip_case_sensitivity:
+        description: 'Skip case-sensitivity check'
+        type: boolean
+        default: false
+      signal_check_required:
+        description: 'Fail if tools/signal_check.js is absent'
+        type: boolean
+        default: true
+
+      # ── Vitest ─────────────────────────────────────────────────────────────
+
+      skip_vitest:
+        description: 'Skip Vitest entirely (no test suite or suspended)'
+        type: boolean
+        default: false
+      vitest_command:
+        description: 'Command to run Vitest'
+        type: string
+        default: 'npm test'
+
+      # ── Module Manifest ────────────────────────────────────────────────────
+
+      run_module_manifest:
+        description: 'Run module.json field validation'
+        type: boolean
+        default: false
+
+jobs:
+
+  lint:
+    uses: ionrift-gm/ionrift-ci/.github/workflows/lint.yml@main
+    with:
+      skip_eslint: ${{ inputs.skip_eslint }}
+      eslint_version: ${{ inputs.eslint_version }}
+      eslint_pattern: ${{ inputs.eslint_pattern }}
+      eslint_ext_args: ${{ inputs.eslint_ext_args }}
+      eslint_max_warnings: ${{ inputs.eslint_max_warnings }}
+      eslint_extra_args: ${{ inputs.eslint_extra_args }}
+      script_ext: ${{ inputs.script_ext }}
+      include_html: ${{ inputs.include_html }}
+      include_styles: ${{ inputs.include_styles }}
+      inclusion_scan_dirs: ${{ inputs.inclusion_scan_dirs }}
+      skip_import_integrity: ${{ inputs.skip_import_integrity }}
+      skip_case_sensitivity: ${{ inputs.skip_case_sensitivity }}
+      signal_check_required: ${{ inputs.signal_check_required }}
+
+  hygiene:
+    uses: ionrift-gm/ionrift-ci/.github/workflows/hygiene.yml@main
+
+  vitest:
+    if: ${{ !inputs.skip_vitest }}
+    uses: ionrift-gm/ionrift-ci/.github/workflows/vitest.yml@main
+    with:
+      vitest_command: ${{ inputs.vitest_command }}
+
+  module-manifest:
+    if: ${{ inputs.run_module_manifest }}
+    uses: ionrift-gm/ionrift-ci/.github/workflows/module-manifest.yml@main
+
+  summary:
+    name: Pre-Release Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [lint, hygiene, vitest, module-manifest]
+    steps:
+      - name: Build report
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          HYGIENE_RESULT: ${{ needs.hygiene.result }}
+          VITEST_RESULT: ${{ needs.vitest.result }}
+          MANIFEST_RESULT: ${{ needs.module-manifest.result }}
+        run: |
+          STATUS="PASS"
+
+          lint_cell="PASS"
+          if [ "$LINT_RESULT" = "skipped" ]; then lint_cell="SKIPPED"
+          elif [ "$LINT_RESULT" != "success" ]; then lint_cell="**FAIL**"; STATUS="FAIL"; fi
+
+          hygiene_cell="PASS"
+          if [ "$HYGIENE_RESULT" = "skipped" ]; then hygiene_cell="SKIPPED"
+          elif [ "$HYGIENE_RESULT" != "success" ]; then hygiene_cell="**FAIL**"; STATUS="FAIL"; fi
+
+          vitest_cell="PASS"
+          if [ "$VITEST_RESULT" = "skipped" ]; then vitest_cell="SKIPPED"
+          elif [ "$VITEST_RESULT" != "success" ]; then vitest_cell="**FAIL**"; STATUS="FAIL"; fi
+
+          manifest_cell="PASS"
+          if [ "$MANIFEST_RESULT" = "skipped" ]; then manifest_cell="SKIPPED"
+          elif [ "$MANIFEST_RESULT" != "success" ]; then manifest_cell="**FAIL**"; STATUS="FAIL"; fi
+
+          cat > pre-release-report.md << EOF
+          # Pre-Release Gate Report
+
+          | Check | Result |
+          |-------|--------|
+          | Lint & Static Analysis | ${lint_cell} |
+          | Artifact Hygiene | ${hygiene_cell} |
+          | Unit Tests (Vitest) | ${vitest_cell} |
+          | Module Manifest | ${manifest_cell} |
+          EOF
+
+          echo "" >> pre-release-report.md
+          if [ "$STATUS" = "PASS" ]; then
+            echo "**All gates passed. Safe to tag.**" >> pre-release-report.md
+          else
+            echo "**One or more gates failed. Do not tag until resolved.**" >> pre-release-report.md
+          fi
+
+          cat pre-release-report.md
+          cat pre-release-report.md >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" = "FAIL" ]; then
+            exit 1
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-release-report
+          path: pre-release-report.md

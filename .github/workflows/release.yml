@@ -1,0 +1,312 @@
+# =============================================================================
+# Reusable Workflow: release.yml
+# Repository: ionrift-gm/ionrift-ci
+# Called as:  ionrift-gm/ionrift-ci/.github/workflows/release.yml@main
+#
+# Tag push: checkout, zip, GitHub release, Foundry package notify, optional
+# Discord embed from CHANGELOG.
+# dry_run_discord: Discord-only manual run (no zip, no GitHub release, no
+# Foundry notify). Caller maps secrets (e.g. FOUNDRY_PACKAGE_TOKEN from a
+# differently named repo secret).
+# =============================================================================
+name: Reusable Module Release
+
+on:
+  workflow_call:
+    inputs:
+      dry_run_discord:
+        description: 'Manual Discord-only run; skips zip, gh release, and Foundry notify.'
+        type: boolean
+        default: false
+      checkout_lfs:
+        description: 'Set true when the repo uses Git LFS for release assets.'
+        type: boolean
+        default: false
+      validate_lfs_pack_mp3:
+        description: 'Run sounds/pack MP3 byte-size guard (LFS pointer check).'
+        type: boolean
+        default: false
+      zip_extra_args:
+        description: 'Extra zip -x patterns appended to the zip command (quoted segments).'
+        type: string
+        default: ''
+      discord_title_prefix:
+        description: 'Discord embed title prefix before " - v{version}" from CHANGELOG.'
+        type: string
+        required: true
+      discord_embed_color:
+        description: 'Discord embed color as a base-10 integer (same as JSON color field).'
+        type: string
+        default: '2859969'
+      discord_thumbnail_url:
+        description: 'Full thumbnail URL for the embed. Empty string omits thumbnail.'
+        type: string
+        default: ''
+      skip_discord_job:
+        description: 'If true, no Discord job runs (including dry run).'
+        type: boolean
+        default: false
+    secrets:
+      FOUNDRY_PACKAGE_TOKEN:
+        description: 'Foundry package API token (caller may map from FOUNDRY_RELEASE_TOKEN).'
+        required: true
+      DISCORD_WEBHOOK_URL:
+        description: 'Optional Discord webhook; missing webhook logs a warning and skips.'
+        required: false
+
+jobs:
+  build:
+    if: ${{ !inputs.dry_run_discord }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: ${{ inputs.checkout_lfs }}
+
+      - name: Validate pack MP3 artifacts
+        if: ${{ inputs.validate_lfs_pack_mp3 }}
+        run: |
+          FIRST_MP3=$(find sounds/pack -name '*.mp3' -type f | head -1)
+          if [ -z "$FIRST_MP3" ]; then
+            echo "ERROR: No MP3 files found in sounds/pack/"
+            exit 1
+          fi
+          SIZE=$(wc -c < "$FIRST_MP3")
+          if [ "$SIZE" -lt 1000 ]; then
+            echo "ERROR: $FIRST_MP3 is only ${SIZE} bytes (likely an LFS pointer, not audio)"
+            exit 1
+          fi
+          echo "OK: Sound files are real audio (first file: $FIRST_MP3, ${SIZE} bytes)"
+
+      - name: Zip Module
+        env:
+          ZIP_EXTRA_ARGS: ${{ inputs.zip_extra_args }}
+        run: |
+          set -e
+          zip -r module.zip . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x ".gitignore" \
+            -x ".gitattributes" \
+            -x "RELEASE_WORKFLOW.md" \
+            -x "task.md" \
+            -x "package.json" \
+            -x "package-lock.json" \
+            -x "node_modules/*" \
+            -x "dist/*" \
+            -x "scripts/tests/*" \
+            -x "scripts/utils/*" \
+            -x "tests/*" \
+            -x "debug_*.js" \
+            -x "debug_*.log" \
+            -x "audit_*.json" \
+            -x "audit_*.txt" \
+            -x "audit_*.js" \
+            -x "*.bak" \
+            -x "wiki-images/*" \
+            -x "BACKLOG.md" \
+            -x "SETUP_GUIDE.md" \
+            -x "docs/*" \
+            $ZIP_EXTRA_ARGS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            module.zip
+            module.json
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          generate_release_notes: true
+          make_latest: ${{ !(contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha')) }}
+
+      - name: Notify Foundry VTT
+        if: success() && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-alpha')
+        uses: actions/github-script@v7
+        env:
+          FOUNDRY_TOKEN: ${{ secrets.FOUNDRY_PACKAGE_TOKEN }}
+        with:
+          script: |
+            const fs = require('fs');
+            const manifest = JSON.parse(fs.readFileSync('module.json', 'utf8'));
+            const payload = {
+              id: manifest.id,
+              release: {
+                version: manifest.version,
+                manifest: `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/latest/download/module.json`,
+                notes: `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/v${manifest.version}`,
+                compatibility: manifest.compatibility
+              }
+            };
+            console.log('Sending payload:', JSON.stringify(payload, null, 2));
+            const response = await fetch('https://foundryvtt.com/_api/packages/release_version/', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': process.env.FOUNDRY_TOKEN },
+              body: JSON.stringify(payload)
+            });
+            const text = await response.text();
+            let data;
+            try { data = JSON.parse(text); } catch { data = text; }
+            console.log('Response:', typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+            if (!response.ok) {
+              core.setFailed(`Foundry API Error (${response.status}): ${typeof data === 'string' ? data : JSON.stringify(data)}`);
+            } else {
+              console.log('Foundry VTT notified successfully.');
+            }
+
+  notify-discord:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !inputs.skip_discord_job && !inputs.dry_run_discord && success() && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-alpha') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_TITLE_PREFIX: ${{ inputs.discord_title_prefix }}
+          DISCORD_EMBED_COLOR: ${{ inputs.discord_embed_color }}
+          DISCORD_THUMBNAIL_URL: ${{ inputs.discord_thumbnail_url }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const changelog = fs.readFileSync('CHANGELOG.md', 'utf8');
+            const versionMatch = changelog.match(/^## \[([^\]]+)\]/m);
+            const version = versionMatch ? versionMatch[1] : 'unknown';
+            const lines = changelog.split('\n');
+            const body = [];
+            let found = false;
+            for (const line of lines) {
+              if (line.startsWith('## ')) {
+                if (found) break;
+                found = true;
+                continue;
+              }
+              if (found) {
+                if (line.startsWith('### ')) {
+                  body.push('', `**${line.slice(4)}**`);
+                } else {
+                  body.push(line);
+                }
+              }
+            }
+            let desc = body.join('\n').trim();
+            if (desc.length > 3900) {
+              desc = desc.slice(0, 3900) + '\n\n_see full notes on GitHub_';
+            }
+            const repo = process.env.GITHUB_REPOSITORY;
+            const tag = process.env.GITHUB_REF_NAME;
+            const prefix = process.env.DISCORD_TITLE_PREFIX || 'Ionrift';
+            const color = parseInt(process.env.DISCORD_EMBED_COLOR || '0', 10);
+            const thumb = (process.env.DISCORD_THUMBNAIL_URL || '').trim();
+            const embed = {
+              title: `${prefix} - v${version}`,
+              description: desc,
+              color,
+              url: `https://github.com/${repo}/releases/tag/${tag}`
+            };
+            if (thumb) {
+              embed.thumbnail = { url: thumb };
+            }
+            const payload = { embeds: [embed] };
+            const webhook = process.env.DISCORD_WEBHOOK;
+            if (!webhook) {
+              core.warning('DISCORD_WEBHOOK_URL secret is not set - skipping Discord notification');
+              return;
+            }
+            const resp = await fetch(webhook, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+              const t = await resp.text();
+              core.setFailed(`Discord webhook failed (${resp.status}): ${t}`);
+            } else {
+              console.log('Discord notification posted successfully.');
+            }
+
+  discord-manual:
+    name: Discord (manual dry run)
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_discord_job && inputs.dry_run_discord }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_TITLE_PREFIX: ${{ inputs.discord_title_prefix }}
+          DISCORD_EMBED_COLOR: ${{ inputs.discord_embed_color }}
+          DISCORD_THUMBNAIL_URL: ${{ inputs.discord_thumbnail_url }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const changelog = fs.readFileSync('CHANGELOG.md', 'utf8');
+            const versionMatch = changelog.match(/^## \[([^\]]+)\]/m);
+            const version = versionMatch ? versionMatch[1] : 'unknown';
+            const lines = changelog.split('\n');
+            const body = [];
+            let found = false;
+            for (const line of lines) {
+              if (line.startsWith('## ')) {
+                if (found) break;
+                found = true;
+                continue;
+              }
+              if (found) {
+                if (line.startsWith('### ')) {
+                  body.push('', `**${line.slice(4)}**`);
+                } else {
+                  body.push(line);
+                }
+              }
+            }
+            let desc = body.join('\n').trim();
+            if (desc.length > 3900) {
+              desc = desc.slice(0, 3900) + '\n\n_see full notes on GitHub_';
+            }
+            const repo = process.env.GITHUB_REPOSITORY;
+            const tag = process.env.GITHUB_REF_NAME;
+            const prefix = process.env.DISCORD_TITLE_PREFIX || 'Ionrift';
+            const color = parseInt(process.env.DISCORD_EMBED_COLOR || '0', 10);
+            const thumb = (process.env.DISCORD_THUMBNAIL_URL || '').trim();
+            const embed = {
+              title: `${prefix} - v${version} (dry run)`,
+              description: desc,
+              color,
+              url: `https://github.com/${repo}`
+            };
+            if (thumb) {
+              embed.thumbnail = { url: thumb };
+            }
+            const payload = { embeds: [embed] };
+            const webhook = process.env.DISCORD_WEBHOOK;
+            if (!webhook) {
+              core.setFailed('DISCORD_WEBHOOK_URL secret is not set');
+              return;
+            }
+            const resp = await fetch(webhook, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+              const t = await resp.text();
+              core.setFailed(`Discord webhook failed (${resp.status}): ${t}`);
+            } else {
+              console.log('Discord dry run posted successfully.');
+            }

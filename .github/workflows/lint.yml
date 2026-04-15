@@ -6,6 +6,8 @@
 # Covers: ESLint, Inclusion Terminology Scan, Import Integrity,
 #         Case-Sensitivity Check, and Signal Check.
 #
+# Import patterns checked: static import/from, dynamic import(), relative fetch().
+#
 # Jobs run in parallel. Consumers set `needs: [lint]` to gate on all passing.
 # Jobs flagged with skip_* inputs are skipped (not failed) for compiled modules.
 # =============================================================================
@@ -150,6 +152,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 3 — Import Integrity Check
   # Detects broken relative imports (files referenced in JS that do not exist).
+  # Patterns: static import/from, dynamic import(), relative fetch().
   # ─────────────────────────────────────────────────────────────────────────────
   import-integrity:
     name: Import Integrity Check
@@ -173,7 +176,11 @@ jobs:
           const path = require('path');
           const ROOT = path.resolve('scripts');
           const ext = process.env.SCRIPT_EXT || '.js';
-          const importRe = /(?:import|from)\s+['"](\.[^'"]+)['"]/g;
+          const patterns = [
+            /(?:import|from)\s+['"](\.[^'"]+)['"]/g,   // static import/from
+            /import\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g,   // dynamic import()
+            /fetch\s*\(\s*['"](\.\.?[^'"]+)['"]\s*\)/g  // relative fetch()
+          ];
           let failed = false;
 
           function sourceWithoutLineComments(src) {
@@ -181,9 +188,11 @@ jobs:
           }
 
           function collectImports(src) {
-            const out = []; let m;
-            importRe.lastIndex = 0;
-            while ((m = importRe.exec(src)) !== null) out.push(m[1]);
+            const out = [];
+            for (const re of patterns) {
+              re.lastIndex = 0; let m;
+              while ((m = re.exec(src)) !== null) out.push(m[1]);
+            }
             return out;
           }
 
@@ -213,6 +222,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 4 — Case-Sensitivity Check
   # Catches imports that differ only in case: break on Linux CI, silent on Windows.
+  # Patterns: static import/from, dynamic import(), relative fetch().
   # ─────────────────────────────────────────────────────────────────────────────
   case-sensitivity:
     name: Case-Sensitivity Check
@@ -236,7 +246,11 @@ jobs:
           const path = require('path');
           const ROOT = path.resolve('scripts');
           const ext = process.env.SCRIPT_EXT || '.js';
-          const importRe = /(?:import|from)\s+['"](\.[^'"]+)['"]/g;
+          const patterns = [
+            /(?:import|from)\s+['"](\.[^'"]+)['"]/g,   // static import/from
+            /import\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g,   // dynamic import()
+            /fetch\s*\(\s*['"](\.\.?[^'"]+)['"]\s*\)/g  // relative fetch()
+          ];
           let failed = false;
 
           const manifest = new Map();
@@ -249,9 +263,11 @@ jobs:
           }
 
           function collectImports(src) {
-            const out = []; let m;
-            importRe.lastIndex = 0;
-            while ((m = importRe.exec(src)) !== null) out.push(m[1]);
+            const out = [];
+            for (const re of patterns) {
+              re.lastIndex = 0; let m;
+              while ((m = re.exec(src)) !== null) out.push(m[1]);
+            }
             return out;
           }
 

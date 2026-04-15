@@ -76,14 +76,27 @@ on:
         type: boolean
         default: false
       vitest_command:
-        description: 'Command to run Vitest'
+        description: 'Command to run Vitest (used when testharness_repo is empty)'
         type: string
         default: 'npm test'
+      testharness_repo:
+        description: 'Private repo containing test files (optional)'
+        type: string
+        default: ''
+      testharness_config:
+        description: 'Vitest config path relative to testharness checkout'
+        type: string
+        default: ''
 
       # ── Module Manifest ────────────────────────────────────────────────────
 
       run_module_manifest:
         description: 'Run module.json field validation'
+
+    secrets:
+      CI_PAT:
+        description: 'PAT for testharness repo access (required if testharness_repo is set)'
+        required: false
         type: boolean
         default: false
 
@@ -114,6 +127,10 @@ jobs:
     uses: ionrift-gm/ionrift-ci/.github/workflows/vitest.yml@main
     with:
       vitest_command: ${{ inputs.vitest_command }}
+      testharness_repo: ${{ inputs.testharness_repo }}
+      testharness_config: ${{ inputs.testharness_config }}
+    secrets:
+      CI_PAT: ${{ secrets.CI_PAT }}
 
   module-manifest:
     if: ${{ inputs.run_module_manifest }}

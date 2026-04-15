@@ -16,6 +16,18 @@ on:
         description: 'Command to run Vitest (default: npm test)'
         type: string
         default: 'npm test'
+      testharness_repo:
+        description: 'Private repo containing test files (optional). If set, tests run from here instead of the calling repo.'
+        type: string
+        default: ''
+      testharness_config:
+        description: 'Vitest config path relative to the testharness checkout (required if testharness_repo is set).'
+        type: string
+        default: ''
+    secrets:
+      CI_PAT:
+        description: 'PAT with read access to the testharness repo (required if testharness_repo is set).'
+        required: false
 
 jobs:
 
@@ -29,15 +41,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout testharness
+        if: inputs.testharness_repo != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.testharness_repo }}
+          token: ${{ secrets.CI_PAT }}
+          path: .testharness
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install dependencies
-        # npm install instead of npm ci: lockfiles generated on Windows contain
-        # win32-specific optional Rollup binaries that don't exist on Ubuntu runners.
+      - name: Install dependencies (module)
         run: npm install
 
-      - name: Run Vitest
+      - name: Install dependencies (testharness)
+        if: inputs.testharness_repo != ''
+        working-directory: .testharness
+        run: npm install
+
+      - name: Run Vitest (from testharness)
+        if: inputs.testharness_repo != ''
+        working-directory: .testharness
+        env:
+          MODULE_ROOT: ${{ github.workspace }}
+        run: npx vitest run --config ${{ inputs.testharness_config }}
+
+      - name: Run Vitest (from module)
+        if: inputs.testharness_repo == ''
         run: ${{ inputs.vitest_command }}

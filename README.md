@@ -12,7 +12,7 @@ All Ionrift module CI pipelines call these workflows instead of duplicating the 
 |------|---------|---------|
 | `lint.yml` | ESLint, inclusion scan, import integrity, case-sensitivity | All source modules |
 | `hygiene.yml` | Dev doc / tooling / LevelDB sweep | All modules |
-| `vitest.yml` | Headless Vitest unit tests | library, respite, arbiter, workshop |
+| `vitest.yml` | Headless Vitest unit tests | library, respite, quartermaster, resonance |
 | `module-manifest.yml` | Validates `module.json` fields | ionrift-library |
 
 ---

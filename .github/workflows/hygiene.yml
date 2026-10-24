@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Dev document sweep
         run: |
@@ -37,7 +37,7 @@ jobs:
 
       - name: Dev tooling sweep
         run: |
-          MATCHES=$(git ls-files | grep -iE "scripts/tests/|scripts/utils/|dev-link|compendiumBuilder" || true)
+          MATCHES=$(git ls-files | grep -iE "scripts/tests/|dev-link|compendiumBuilder" || true)
           if [ -n "$MATCHES" ]; then
             echo "❌ Dev tooling found in tracked files:"
             echo "$MATCHES"

@@ -4,8 +4,7 @@
 # Called as:  ionrift-gm/ionrift-ci/.github/workflows/vitest.yml@main
 #
 # Covers: Headless Vitest unit tests. No Foundry runtime required.
-# Used by: ionrift-library, ionrift-respite, ionrift-arbiter, ionrift-workshop.
-# Not used by: ionrift-resonance (compiled scripts, no Vitest suite).
+# Used by: ionrift-library, ionrift-respite, ionrift-quartermaster, ionrift-resonance.
 # =============================================================================
 name: Unit Tests (Vitest)
 
@@ -24,6 +23,10 @@ on:
         description: 'Vitest config path relative to the testharness checkout (required if testharness_repo is set).'
         type: string
         default: ''
+      sibling_repos:
+        description: 'Space-separated repos checked out inside the workspace (ionrift-gm/ionrift-library).'
+        type: string
+        default: ''
     secrets:
       CI_PAT:
         description: 'PAT with read access to the testharness repo (required if testharness_repo is set).'
@@ -39,18 +42,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout testharness
         if: inputs.testharness_repo != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.testharness_repo }}
           token: ${{ secrets.CI_PAT }}
           path: .testharness
 
+      - name: Checkout sibling repos
+        if: inputs.sibling_repos != ''
+        env:
+          SIBLING_REPOS: ${{ inputs.sibling_repos }}
+          CI_PAT: ${{ secrets.CI_PAT }}
+        run: |
+          set -euo pipefail
+          for repo in $SIBLING_REPOS; do
+            name="${repo##*/}"
+            rm -rf "$name"
+            cloned=0
+            if git clone --depth 1 "https://github.com/${repo}.git" "$name" >/dev/null 2>&1; then
+              cloned=1
+            elif [ -n "${CI_PAT:-}" ]; then
+              auth=$(printf 'x-access-token:%s' "$CI_PAT" | base64 -w 0)
+              if git -c http.extraheader="AUTHORIZATION: basic ${auth}" \
+                clone --depth 1 "https://github.com/${repo}.git" "$name" >/dev/null 2>&1; then
+                cloned=1
+              fi
+            fi
+            if [ "$cloned" -ne 1 ]; then
+              rm -rf "$name"
+              echo "Sibling checkout failed: ${name} is not available."
+              exit 1
+            fi
+            echo "Checked out ${name}."
+          done
+
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
 

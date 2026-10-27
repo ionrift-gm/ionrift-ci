@@ -2,8 +2,13 @@ name: CI - Commit Identity Gate
 
 # Reusable: other Ionrift repos call this with
 #   uses: ionrift-gm/ionrift-ci/.github/workflows/identity-gate.yml@main
+#   secrets:
+#     IDENTITY_DENYLIST: ${{ secrets.IDENTITY_DENYLIST }}
 on:
   workflow_call:
+    secrets:
+      IDENTITY_DENYLIST:
+        required: false
   push:
     branches: ['**']
     tags-ignore: ['**']
@@ -20,7 +25,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: verify commit identity
+      - name: collect commits
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
@@ -29,9 +34,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          ALLOWED="ionrift.gm@gmail.com"
           ZERO="0000000000000000000000000000000000000000"
-
           if [ "$EVENT" = "pull_request" ]; then
             set -- "$PR_BASE..$PR_HEAD"
           elif [ -n "$BEFORE" ] && [ "$BEFORE" != "$ZERO" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
@@ -41,9 +44,15 @@ jobs:
           else
             set -- -1 HEAD
           fi
+          git rev-list "$@" > "$RUNNER_TEMP/gate-commits"
+          echo "Checking $(wc -l < "$RUNNER_TEMP/gate-commits") commit(s)."
 
+      - name: verify commit identity
+        run: |
+          ALLOWED="ionrift.gm@gmail.com"
           FAILED=0
-          for sha in $(git rev-list "$@"); do
+          while read -r sha; do
+            [ -n "$sha" ] || continue
             short=$(git rev-parse --short "$sha")
             ae=$(git log -1 --format='%ae' "$sha")
             ce=$(git log -1 --format='%ce' "$sha")
@@ -59,10 +68,70 @@ jobs:
               echo "::error::Commit $short: message contains a Co-authored-by trailer."
               FAILED=1
             fi
-          done
-
+          done < "$RUNNER_TEMP/gate-commits"
           if [ "$FAILED" -eq 1 ]; then
             echo "::error::Identity gate failed."
             exit 1
           fi
-          echo "All commits pass the identity gate."
+          echo "All commits pass the identity check."
+
+      - name: check blocked terms
+        env:
+          IDENTITY_DENYLIST: ${{ secrets.IDENTITY_DENYLIST }}
+          FROM_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          node - <<'EOF'
+          // Never prints a term, a matched line or any commit content.
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
+          const git = (a) => execFileSync('git', a, { encoding: 'utf8', maxBuffer: 1 << 30 });
+          const raw = process.env.IDENTITY_DENYLIST || '';
+          if (!raw.trim()) {
+            if (process.env.FROM_FORK === 'true') {
+              console.log('::notice::Blocked-term check skipped: secrets are not available to fork pull requests.');
+              process.exit(0);
+            }
+            console.log('::error::Blocked-term list is not available to this run. Pass IDENTITY_DENYLIST to the shared gate.');
+            process.exit(1);
+          }
+          const any = [], words = [];
+          for (let line of raw.split(/\r?\n/)) {
+            line = line.trim();
+            if (!line || line.startsWith('#')) continue;
+            let mode = null;
+            const m = /^(any|word):\s*/i.exec(line);
+            if (m) { mode = m[1].toLowerCase(); line = line.slice(m[0].length).trim(); }
+            if (!line) continue;
+            const t = line.toLowerCase();
+            if (!mode) mode = /^[\p{L}' -]+$/u.test(t) ? 'word' : 'any';
+            if (mode === 'word') { words.push(t); continue; }
+            any.push(t);
+            if (t.includes('\\')) { any.push(t.replace(/\\/g, '/')); any.push(t.replace(/\\/g, '\\\\')); }
+          }
+          const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const wordRes = words.map((w) => new RegExp(`(?<![\\p{L}\\p{N}])${esc(w)}(?![\\p{L}\\p{N}])`, 'iu'));
+          const hits = (s) => { const l = s.toLowerCase(); return any.some((t) => l.includes(t)) || wordRes.some((r) => r.test(s)); };
+
+          const shas = fs.readFileSync(process.env.RUNNER_TEMP + '/gate-commits', 'utf8').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+          process.on('uncaughtException', () => { console.log('::error::Blocked-term check hit an internal error; failing to be safe.'); process.exit(1); });
+          let failed = false;
+          for (const sha of shas) {
+            const short = sha.slice(0, 7);
+            const [an, cn, body] = git(['log', '-1', '--format=%an%x00%cn%x00%B', sha]).split('\0');
+            const problems = [];
+            if (hits(an) || hits(cn)) problems.push('author or committer name contains a blocked term');
+            if (hits(body || '')) problems.push('message contains a blocked term');
+            const diff = git(['show', '--format=', '--no-color', '--no-ext-diff', '--no-textconv', '--diff-merges=first-parent', '-U0', sha]);
+            let inHunk = false, added = false;
+            for (const line of diff.split('\n')) {
+              if (line.startsWith('diff --git ')) { inHunk = false; continue; }
+              if (line.startsWith('@@')) { inHunk = true; continue; }
+              if (inHunk && line.startsWith('+') && hits(line.slice(1))) { added = true; break; }
+            }
+            if (added) problems.push('adds a line containing a blocked term');
+            for (const p of problems) console.log(`::error::Commit ${short}: ${p}.`);
+            if (problems.length) failed = true;
+          }
+          if (failed) { console.log('::error::Identity gate failed.'); process.exit(1); }
+          console.log('No blocked terms found.');
+          EOF

@@ -266,6 +266,7 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `published_at=${publishedAt}\n`);
           console.log(`Validated ${moduleId} v${version} (gcs_path=${gcsPath || "none"})`);
           EOF
+          node ionrift-pack-registry/scripts/validate-registry-alignment.mjs
 
       - name: Probe IONRIFTGM_GIT_TOKEN capabilities (preflight)
         if: ${{ inputs.preflight_only }}

@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      preflight_only:
+        description: "Run only predictive preflight checks without side effects"
+        required: false
+        type: boolean
+        default: false
     secrets:
       GCP_SA_KEY_PROD:
         description: "GCP service account credentials JSON for ionrift-tokens-prod"
@@ -84,19 +89,34 @@ jobs:
       - name: Verify required secrets
         shell: bash
         env:
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only && 'true' || 'false' }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           UPLOAD_GCS: ${{ inputs.upload_gcs && 'true' || 'false' }}
           HAS_GIT_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN != '' && 'true' || 'false' }}
           HAS_GCP_KEY: ${{ secrets.GCP_SA_KEY_PROD != '' && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          if [ "$HAS_GIT_TOKEN" != "true" ]; then
-            echo "::error::Required secret IONRIFTGM_GIT_TOKEN is not configured on caller repository."
-            exit 1
-          fi
-          if [ "$DRY_RUN" != "true" ] && [ "$UPLOAD_GCS" = "true" ] && [ "$HAS_GCP_KEY" != "true" ]; then
-            echo "::error::Required secret GCP_SA_KEY_PROD is not configured on caller repository."
-            exit 1
+          if [ "$PREFLIGHT_ONLY" = "true" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "::warning::dry_run is true; a tag will still create the GitHub release and will not update the Module Shelf."
+            fi
+            if [ "$HAS_GIT_TOKEN" != "true" ]; then
+              echo "::error::Shelf preflight failed: IONRIFTGM_GIT_TOKEN is not configured on the caller repository (required even when dry_run is true). No GitHub release was created. Add the secret before tagging."
+              exit 1
+            fi
+            if [ "$DRY_RUN" != "true" ] && [ "$UPLOAD_GCS" = "true" ] && [ "$HAS_GCP_KEY" != "true" ]; then
+              echo "::error::Shelf preflight failed: GCP_SA_KEY_PROD is not configured on the caller repository. No GitHub release was created. Add the secret before tagging."
+              exit 1
+            fi
+          else
+            if [ "$HAS_GIT_TOKEN" != "true" ]; then
+              echo "::error::Required secret IONRIFTGM_GIT_TOKEN is not configured on caller repository."
+              exit 1
+            fi
+            if [ "$DRY_RUN" != "true" ] && [ "$UPLOAD_GCS" = "true" ] && [ "$HAS_GCP_KEY" != "true" ]; then
+              echo "::error::Required secret GCP_SA_KEY_PROD is not configured on caller repository."
+              exit 1
+            fi
           fi
 
       - name: Checkout caller repository
@@ -221,6 +241,23 @@ jobs:
             process.exit(1);
           }
 
+          const registryPath = path.resolve("ionrift-pack-registry/registry.json");
+          if (!fs.existsSync(registryPath)) {
+            console.error("::error::ionrift-pack-registry/registry.json not found.");
+            process.exit(1);
+          }
+          const registrySource = fs.readFileSync(registryPath, "utf8");
+          const modulesIdx = registrySource.indexOf('"modules":');
+          if (modulesIdx === -1) {
+            console.error("::error::modules section not found in registry.json.");
+            process.exit(1);
+          }
+          const modMarkerIdx = registrySource.indexOf(`"${moduleId}":`, modulesIdx);
+          if (modMarkerIdx === -1) {
+            console.error(`::error::modules["${moduleId}"] not found in registry.json.`);
+            process.exit(1);
+          }
+
           const gcsPath = uploadGcs ? `modules/${moduleId}/${moduleId}-${version}.zip` : "";
           const publishedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 
@@ -230,8 +267,28 @@ jobs:
           console.log(`Validated ${moduleId} v${version} (gcs_path=${gcsPath || "none"})`);
           EOF
 
+      - name: Probe IONRIFTGM_GIT_TOKEN capabilities (preflight)
+        if: ${{ inputs.preflight_only }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          for REPO in "ionrift-gm/ionrift-cloud" "ionrift-gm/ionrift-pack-registry"; do
+            CAN_PUSH="$(gh api "repos/${REPO}" --jq '.permissions.push // false' 2>/dev/null || echo "false")"
+            if [ "$CAN_PUSH" != "true" ]; then
+              echo "::error::Shelf preflight failed: IONRIFTGM_GIT_TOKEN does not have Contents push permission on ${REPO} (permissions.push=${CAN_PUSH}). Token requires Contents + Pull requests read/write on both ionrift-cloud and ionrift-pack-registry. No GitHub release was created."
+              exit 1
+            fi
+            if ! gh pr list --repo "$REPO" --state all --limit 1 >/dev/null 2>&1; then
+              echo "::error::Shelf preflight failed: IONRIFTGM_GIT_TOKEN cannot list pull requests on ${REPO}. Token requires Contents + Pull requests read/write on both ionrift-cloud and ionrift-pack-registry. No GitHub release was created."
+              exit 1
+            fi
+            echo "Verified permissions.push=true and gh pr list on ${REPO}"
+          done
+
       - name: Acquire and verify release zip
-        if: ${{ inputs.upload_gcs }}
+        if: ${{ !inputs.preflight_only && inputs.upload_gcs }}
         shell: bash
         env:
           MODULE_ID: ${{ inputs.module_id }}
@@ -292,6 +349,7 @@ jobs:
           rm -rf "$EXTRACT_DIR"
 
       - name: Prepare catalog, registry, snapshot, and INSTALLABLE_MODULES check
+        if: ${{ !inputs.preflight_only }}
         shell: bash
         env:
           MODULE_ID: ${{ inputs.module_id }}
@@ -492,7 +550,7 @@ jobs:
           node ionrift-cloud/middleware/scripts/check-bundle-artifacts.mjs --registry ionrift-pack-registry/registry.json
 
       - name: Dry run summary
-        if: ${{ inputs.dry_run }}
+        if: ${{ !inputs.preflight_only && inputs.dry_run }}
         shell: bash
         env:
           MODULE_ID: ${{ inputs.module_id }}
@@ -540,8 +598,68 @@ jobs:
         if: ${{ !inputs.dry_run && inputs.upload_gcs }}
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Probe GCS write access (preflight)
+        if: ${{ inputs.preflight_only && !inputs.dry_run && inputs.upload_gcs }}
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          PROBE_URI="gs://ionrift-packs-prod/modules/${MODULE_ID}/.preflight/probe-${RUN_ID}-${RUN_ATTEMPT}.txt"
+          cleanup() {
+            gsutil -q -o "GSUtil:default_project_id=ionrift-tokens-prod" rm -f "$PROBE_URI" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          if ! printf 'preflight-probe %s\n' "${RUN_ID}" | gsutil -q -o "GSUtil:default_project_id=ionrift-tokens-prod" cp - "$PROBE_URI"; then
+            echo "::error::Shelf preflight failed: GCP_SA_KEY_PROD could not write probe object to ${PROBE_URI}. No GitHub release was created."
+            exit 1
+          fi
+          if ! gsutil -q -o "GSUtil:default_project_id=ionrift-tokens-prod" stat "$PROBE_URI"; then
+            echo "::error::Shelf preflight failed: GCP_SA_KEY_PROD could not stat probe object at ${PROBE_URI}. No GitHub release was created."
+            exit 1
+          fi
+          if ! gsutil -q -o "GSUtil:default_project_id=ionrift-tokens-prod" rm "$PROBE_URI"; then
+            echo "::error::Shelf preflight failed: GCP_SA_KEY_PROD could not delete probe object at ${PROBE_URI}. No GitHub release was created."
+            exit 1
+          fi
+          echo "Verified GCS write and cleanup on ${PROBE_URI}"
+
+      - name: Write preflight summary
+        if: ${{ inputs.preflight_only }}
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GCS_PATH: ${{ steps.validate.outputs.gcs_path }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          UPLOAD_GCS: ${{ inputs.upload_gcs && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Module Shelf Preflight Passed"
+            echo ""
+            echo "Preflight passed. No GitHub release, GCS upload, catalog PR, or Cloud Run deploy was attempted in this preflight job."
+            echo ""
+            echo "- **Module:** \`${MODULE_ID}\`"
+            echo "- **Version:** \`${VERSION}\`"
+            echo "- **Dry Run:** \`${DRY_RUN}\`"
+            if [ "$UPLOAD_GCS" = "true" ]; then
+              echo "- **Planned GCS Object:** \`gs://ionrift-packs-prod/${GCS_PATH}\`"
+            else
+              echo "- **Planned GCS Object:** *(skipped, \`upload_gcs: false\`)*"
+            fi
+            if [ "$DRY_RUN" != "true" ] && [ "$UPLOAD_GCS" = "true" ]; then
+              echo "- **GCS Probe:** Verified write + delete under \`gs://ionrift-packs-prod/modules/${MODULE_ID}/.preflight/\`"
+            else
+              echo "- **GCS Probe:** Skipped (\`dry_run: ${DRY_RUN}\`, \`upload_gcs: ${UPLOAD_GCS}\`)"
+            fi
+            echo "- **Git Token Probe:** Verified \`permissions.push\` and \`gh pr list\` on \`ionrift-gm/ionrift-cloud\` and \`ionrift-gm/ionrift-pack-registry\`. *(Note: GitHub's REST API cannot distinguish fine-grained \`Pull requests: write\` from \`Pull requests: read\` without creating a PR; ensure \`IONRIFTGM_GIT_TOKEN\` has Contents + Pull requests read/write on both repos.)*"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload module zip to GCS
-        if: ${{ !inputs.dry_run && inputs.upload_gcs }}
+        if: ${{ !inputs.preflight_only && !inputs.dry_run && inputs.upload_gcs }}
         shell: bash
         env:
           MODULE_ID: ${{ inputs.module_id }}
@@ -558,7 +676,7 @@ jobs:
           fi
 
       - name: Open PR in ionrift-cloud
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.preflight_only && !inputs.dry_run }}
         id: cloud_pr
         working-directory: ionrift-cloud
         shell: bash
@@ -610,7 +728,7 @@ jobs:
           echo "Opened/updated ionrift-cloud PR: ${PR_URL}"
 
       - name: Open PR in ionrift-pack-registry
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.preflight_only && !inputs.dry_run }}
         id: registry_pr
         working-directory: ionrift-pack-registry
         shell: bash
@@ -649,7 +767,7 @@ jobs:
           echo "Opened/updated ionrift-pack-registry PR: ${PR_URL}"
 
       - name: Deploy middleware (prod)
-        if: ${{ !inputs.dry_run && inputs.deploy_middleware }}
+        if: ${{ !inputs.preflight_only && !inputs.dry_run && inputs.deploy_middleware }}
         working-directory: ionrift-cloud
         shell: bash
         run: |
@@ -662,7 +780,7 @@ jobs:
             --quiet
 
       - name: Write live job summary
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.preflight_only && !inputs.dry_run }}
         shell: bash
         env:
           MODULE_ID: ${{ inputs.module_id }}

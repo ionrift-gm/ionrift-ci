@@ -1,0 +1,22 @@
+{
+  "modules": [
+    {
+      "id": "ionrift-cursewright",
+      "repo": "ionrift-gm/ionrift-cursewright",
+      "tier": "Acolyte",
+      "uploadGcs": true
+    },
+    {
+      "id": "ionrift-voice",
+      "repo": "ionrift-gm/ionrift-voice",
+      "tier": "Acolyte",
+      "uploadGcs": true
+    },
+    {
+      "id": "ionrift-bloodshed",
+      "repo": "ionrift-gm/ionrift-bloodshed",
+      "tier": "Acolyte",
+      "uploadGcs": true
+    }
+  ]
+}

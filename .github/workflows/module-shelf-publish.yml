@@ -1,0 +1,689 @@
+name: Publish Module to Shelf
+
+on:
+  workflow_call:
+    inputs:
+      module_id:
+        description: "Module ID (e.g. ionrift-cursewright)"
+        required: true
+        type: string
+      version:
+        description: "Semver without leading v (or tag ref_name to normalize)"
+        required: true
+        type: string
+      zip_path:
+        description: "Workspace path to built zip or GitHub release asset name (e.g. module.zip)"
+        required: true
+        type: string
+      upload_gcs:
+        description: "Upload module zip to gs://ionrift-packs-prod/modules/<id>/"
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: "Validate and print planned GCS path and catalog/registry diffs without writing"
+        required: false
+        type: boolean
+        default: true
+      deploy_middleware:
+        description: "Deploy generate-token-v3 to ionrift-tokens-prod (requires cloud PR merged first)"
+        required: false
+        type: boolean
+        default: false
+      override_freeze:
+        description: "Allow live execution outside Sun, Tue, Wed (Europe/London)"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      GCP_SA_KEY_PROD:
+        description: "GCP service account credentials JSON for ionrift-tokens-prod"
+        required: false
+      IONRIFTGM_GIT_TOKEN:
+        description: "Fine-grained PAT with Contents + Pull requests read/write on ionrift-cloud and ionrift-pack-registry"
+        required: false
+
+concurrency:
+  group: module-shelf-publish-${{ inputs.module_id }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Shelf publish (${{ inputs.module_id }})
+    runs-on: ubuntu-latest
+    environment: prod-release
+    steps:
+      - name: Release window
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          OVERRIDE_FREEZE: ${{ inputs.override_freeze && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          wd="$(TZ=Europe/London date +%u)"
+          case "$wd" in
+            2|3|7)
+              echo "Europe/London weekday ${wd} is inside the release window (Tue, Wed, Sun)."
+              ;;
+            *)
+              if [ "$OVERRIDE_FREEZE" = "true" ]; then
+                echo "override_freeze is set. Continuing on Europe/London weekday ${wd}."
+              elif [ "$DRY_RUN" = "true" ]; then
+                echo "::warning::Europe/London weekday ${wd} is outside Sun, Tue, and Wed (allowed because dry_run is true)."
+              else
+                echo "Refusing release. Europe/London weekday ${wd} is outside Sun, Tue, and Wed."
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Verify required secrets
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          UPLOAD_GCS: ${{ inputs.upload_gcs && 'true' || 'false' }}
+          HAS_GIT_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN != '' && 'true' || 'false' }}
+          HAS_GCP_KEY: ${{ secrets.GCP_SA_KEY_PROD != '' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_GIT_TOKEN" != "true" ]; then
+            echo "::error::Required secret IONRIFTGM_GIT_TOKEN is not configured on caller repository."
+            exit 1
+          fi
+          if [ "$DRY_RUN" != "true" ] && [ "$UPLOAD_GCS" = "true" ] && [ "$HAS_GCP_KEY" != "true" ]; then
+            echo "::error::Required secret GCP_SA_KEY_PROD is not configured on caller repository."
+            exit 1
+          fi
+
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          path: caller-module
+
+      - name: Checkout ionrift-cloud
+        uses: actions/checkout@v4
+        with:
+          repository: ionrift-gm/ionrift-cloud
+          token: ${{ secrets.IONRIFTGM_GIT_TOKEN }}
+          path: ionrift-cloud
+          fetch-depth: 0
+
+      - name: Checkout ionrift-pack-registry
+        uses: actions/checkout@v4
+        with:
+          repository: ionrift-gm/ionrift-pack-registry
+          token: ${{ secrets.IONRIFTGM_GIT_TOKEN }}
+          path: ionrift-pack-registry
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate version, module.json, and PACK_CATALOG
+        id: validate
+        shell: bash
+        env:
+          INPUT_MODULE_ID: ${{ inputs.module_id }}
+          INPUT_VERSION: ${{ inputs.version }}
+          UPLOAD_GCS: ${{ inputs.upload_gcs && 'true' || 'false' }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          node - <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+
+          const moduleId = (process.env.INPUT_MODULE_ID || "").trim();
+          let rawVersion = (process.env.INPUT_VERSION || "").trim();
+          const refType = (process.env.REF_TYPE || "").trim();
+          const refName = (process.env.REF_NAME || "").trim();
+          const uploadGcs = process.env.UPLOAD_GCS === "true";
+
+          if (!moduleId) {
+            console.error("::error::module_id input is required.");
+            process.exit(1);
+          }
+
+          const modJsonPath = path.resolve("caller-module/module.json");
+          if (!fs.existsSync(modJsonPath)) {
+            console.error("::error::caller-module/module.json not found.");
+            process.exit(1);
+          }
+          const modJson = JSON.parse(fs.readFileSync(modJsonPath, "utf8"));
+
+          if (!rawVersion || (refType !== "tag" && rawVersion === refName)) {
+            rawVersion = String(modJson.version || "").trim();
+          }
+          const version = rawVersion.replace(/^v/, "");
+          if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+            console.error(`::error::Invalid semver version '${version}'.`);
+            process.exit(1);
+          }
+
+          if (modJson.id !== moduleId) {
+            console.error(`::error::module.json id '${modJson.id}' does not match module_id '${moduleId}'.`);
+            process.exit(1);
+          }
+          if (modJson.version !== version) {
+            console.error(`::error::module.json version '${modJson.version}' does not match target version '${version}'.`);
+            process.exit(1);
+          }
+          if (refType === "tag" || refName.startsWith("v")) {
+            const tagVer = refName.replace(/^v/, "");
+            if (tagVer !== version) {
+              console.error(`::error::Git tag version '${tagVer}' does not match target version '${version}'.`);
+              process.exit(1);
+            }
+          }
+
+          const packsPath = path.resolve("ionrift-cloud/middleware/src/packs.js");
+          const packsSource = fs.readFileSync(packsPath, "utf8");
+          const marker = `"${moduleId}":`;
+          const markerIdx = packsSource.indexOf(marker);
+          if (markerIdx === -1) {
+            console.error(`::error::PACK_CATALOG entry not found for ${moduleId} in packs.js.`);
+            process.exit(1);
+          }
+
+          function findMatchingBrace(source, openIdx) {
+            let depth = 0, inString = false, quote = null, escaped = false;
+            for (let i = openIdx; i < source.length; i++) {
+              const ch = source[i];
+              if (inString) {
+                if (escaped) { escaped = false; continue; }
+                if (ch === "\\") { escaped = true; continue; }
+                if (ch === quote) inString = false;
+                continue;
+              }
+              if (ch === '"' || ch === "'") { inString = true; quote = ch; continue; }
+              if (ch === "{") depth++;
+              if (ch === "}") {
+                depth--;
+                if (depth === 0) return i;
+              }
+            }
+            return -1;
+          }
+
+          const openIdx = packsSource.indexOf("{", markerIdx);
+          const closeIdx = findMatchingBrace(packsSource, openIdx);
+          const block = packsSource.slice(openIdx, closeIdx + 1);
+          const existingVerRegex = new RegExp(`"${version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\s*:`);
+          if (existingVerRegex.test(block)) {
+            console.error(`::error::Version '${version}' is already present in PACK_CATALOG["${moduleId}"]. Refusing duplicate version.`);
+            process.exit(1);
+          }
+
+          const gcsPath = uploadGcs ? `modules/${moduleId}/${moduleId}-${version}.zip` : "";
+          const publishedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `gcs_path=${gcsPath}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `published_at=${publishedAt}\n`);
+          console.log(`Validated ${moduleId} v${version} (gcs_path=${gcsPath || "none"})`);
+          EOF
+
+      - name: Acquire and verify release zip
+        if: ${{ inputs.upload_gcs }}
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          ZIP_PATH: ${{ inputs.zip_path }}
+          GH_TOKEN: ${{ github.token }}
+          CALLER_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TARGET_ZIP="/tmp/${MODULE_ID}-${VERSION}.zip"
+          rm -f "$TARGET_ZIP"
+
+          if [ -f "caller-module/${ZIP_PATH}" ]; then
+            cp "caller-module/${ZIP_PATH}" "$TARGET_ZIP"
+            echo "Found workspace zip at caller-module/${ZIP_PATH}"
+          else
+            ASSET_NAME="$(basename "$ZIP_PATH")"
+            echo "Downloading release asset '${ASSET_NAME}' from ${CALLER_REPO}@v${VERSION}..."
+            gh release download "v${VERSION}" \
+              --repo "${CALLER_REPO}" \
+              --pattern "${ASSET_NAME}" \
+              --output "$TARGET_ZIP"
+          fi
+
+          if [ ! -s "$TARGET_ZIP" ]; then
+            echo "::error::Release zip is missing or empty at $TARGET_ZIP"
+            exit 1
+          fi
+
+          EXTRACT_DIR="$(mktemp -d)"
+          unzip -q "$TARGET_ZIP" -d "$EXTRACT_DIR"
+          INNER_JSON=""
+          if [ -f "${EXTRACT_DIR}/module.json" ]; then
+            INNER_JSON="${EXTRACT_DIR}/module.json"
+          elif [ -f "${EXTRACT_DIR}/${MODULE_ID}/module.json" ]; then
+            INNER_JSON="${EXTRACT_DIR}/${MODULE_ID}/module.json"
+          else
+            echo "::error::Release zip does not contain module.json at root or ${MODULE_ID}/module.json"
+            rm -rf "$EXTRACT_DIR"
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("fs");
+            const inner = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const expectedId = process.argv[2];
+            const expectedVer = process.argv[3];
+            if (inner.id !== expectedId) {
+              console.error(`::error::Zip inner module.json id (${inner.id}) !== ${expectedId}`);
+              process.exit(1);
+            }
+            if (inner.version !== expectedVer) {
+              console.error(`::error::Zip inner module.json version (${inner.version}) !== ${expectedVer}`);
+              process.exit(1);
+            }
+            console.log(`Verified zip inner module.json: ${inner.id}@${inner.version}`);
+          ' "$INNER_JSON" "$MODULE_ID" "$VERSION"
+          rm -rf "$EXTRACT_DIR"
+
+      - name: Prepare catalog, registry, snapshot, and INSTALLABLE_MODULES check
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GCS_PATH: ${{ steps.validate.outputs.gcs_path }}
+          PUBLISHED_AT: ${{ steps.validate.outputs.published_at }}
+          UPLOAD_GCS: ${{ inputs.upload_gcs && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          node - <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+
+          const moduleId = process.env.MODULE_ID;
+          const version = process.env.VERSION;
+          const gcsPath = process.env.GCS_PATH;
+          const publishedAt = process.env.PUBLISHED_AT;
+          const uploadGcs = process.env.UPLOAD_GCS === "true";
+
+          function findMatchingBrace(source, openIdx) {
+            let depth = 0, inString = false, quote = null, escaped = false;
+            for (let i = openIdx; i < source.length; i++) {
+              const ch = source[i];
+              if (inString) {
+                if (escaped) { escaped = false; continue; }
+                if (ch === "\\") { escaped = true; continue; }
+                if (ch === quote) inString = false;
+                continue;
+              }
+              if (ch === '"' || ch === "'") { inString = true; quote = ch; continue; }
+              if (ch === "{") depth++;
+              if (ch === "}") {
+                depth--;
+                if (depth === 0) return i;
+              }
+            }
+            return -1;
+          }
+
+          // 1. Update ionrift-cloud/middleware/src/packs.js (LATEST-ONLY)
+          const packsPath = path.resolve("ionrift-cloud/middleware/src/packs.js");
+          let packsSource = fs.readFileSync(packsPath, "utf8");
+          const marker = `"${moduleId}":`;
+          const markerIdx = packsSource.indexOf(marker);
+          const openIdx = packsSource.indexOf("{", markerIdx);
+          const closeIdx = findMatchingBrace(packsSource, openIdx);
+          const existingBlock = packsSource.slice(openIdx, closeIdx + 1);
+
+          const tierMatch = existingBlock.match(/tier:\s*"([^"]+)"/);
+          const cloudInstallMatch = existingBlock.match(/cloudInstall:\s*(true|false)/);
+          const tier = tierMatch ? tierMatch[1] : "Acolyte";
+          const cloudInstall = cloudInstallMatch ? cloudInstallMatch[1] === "true" : false;
+
+          const fieldLines = [
+            `            tier: ${JSON.stringify(tier)},`,
+            `            cloudInstall: ${String(cloudInstall)},`
+          ];
+          if (uploadGcs) {
+            fieldLines.push(`            gcsPath: ${JSON.stringify(gcsPath)},`);
+          }
+          fieldLines.push(`            publishedAt: ${JSON.stringify(publishedAt)}`);
+
+          const replacement = [
+            `{`,
+            `        "${version}": {`,
+            ...fieldLines,
+            `        }`,
+            `    }`
+          ].join("\n");
+
+          packsSource = packsSource.slice(0, openIdx) + replacement + packsSource.slice(closeIdx + 1);
+          fs.writeFileSync(packsPath, packsSource, "utf8");
+
+          // 2. Update ionrift-pack-registry/registry.json
+          const registryPath = path.resolve("ionrift-pack-registry/registry.json");
+          let registrySource = fs.readFileSync(registryPath, "utf8");
+          const todayDate = publishedAt.slice(0, 10);
+          registrySource = registrySource.replace(
+            /("lastUpdated"\s*:\s*)"[^"]*"/,
+            `$1${JSON.stringify(todayDate)}`
+          );
+
+          const modulesIdx = registrySource.indexOf('"modules":');
+          if (modulesIdx === -1) {
+            console.error("::error::modules section not found in registry.json");
+            process.exit(1);
+          }
+          const modMarkerIdx = registrySource.indexOf(`"${moduleId}":`, modulesIdx);
+          if (modMarkerIdx === -1) {
+            console.error(`::error::modules["${moduleId}"] not found in registry.json`);
+            process.exit(1);
+          }
+          const modOpen = registrySource.indexOf("{", modMarkerIdx);
+          const modClose = findMatchingBrace(registrySource, modOpen);
+          let modBlock = registrySource.slice(modOpen, modClose + 1);
+
+          modBlock = modBlock.replace(
+            /("latest"\s*:\s*)"[^"]*"/,
+            `$1${JSON.stringify(version)}`
+          );
+          if (/"releasedAt"\s*:/.test(modBlock)) {
+            modBlock = modBlock.replace(
+              /("releasedAt"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(publishedAt)}`
+            );
+          }
+          if (/"earlyAccess"\s*:\s*\{/.test(modBlock)) {
+            modBlock = modBlock.replace(
+              /("earlyAccess"\s*:\s*\{[\s\S]*?"version"\s*:\s*)"[^"]*"/,
+              `$1${JSON.stringify(version)}`
+            );
+          }
+
+          registrySource = registrySource.slice(0, modOpen) + modBlock + registrySource.slice(modClose + 1);
+          fs.writeFileSync(registryPath, registrySource, "utf8");
+
+          // 3. Regenerate ionrift-pack-registry/ci/pack-catalog-snapshot.json from packs.js
+          const lines = packsSource.split(/\r?\n/);
+          const start = lines.findIndex((line) => /const PACK_CATALOG\s*=\s*\{/.test(line));
+          const snapshot = {};
+          let currentPack = null;
+          for (let i = start + 1; i < lines.length; i++) {
+            const line = lines[i];
+            if (/^\};/.test(line)) break;
+            const packMatch = line.match(/^    "([^"]+)": \{\s*$/);
+            if (packMatch) {
+              currentPack = packMatch[1];
+              snapshot[currentPack] = [];
+              continue;
+            }
+            const verMatch = line.match(/^        "(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)": \{\s*$/);
+            if (verMatch && currentPack) {
+              snapshot[currentPack].push(verMatch[1]);
+            }
+          }
+          const ordered = {};
+          for (const id of Object.keys(snapshot).sort()) ordered[id] = snapshot[id];
+          const snapshotPath = path.resolve("ionrift-pack-registry/ci/pack-catalog-snapshot.json");
+          fs.writeFileSync(snapshotPath, `${JSON.stringify(ordered, null, 2)}\n`, "utf8");
+
+          // 4. Compare caller module.json against INSTALLABLE_MODULES in foundryModuleInstall.js (read-only flag)
+          const callerManifestPath = fs.existsSync("caller-module/.build/module.json")
+            ? path.resolve("caller-module/.build/module.json")
+            : path.resolve("caller-module/module.json");
+          const callerManifest = JSON.parse(fs.readFileSync(callerManifestPath, "utf8"));
+          const fmiPath = path.resolve("ionrift-cloud/middleware/src/foundryModuleInstall.js");
+          const fmiSource = fs.readFileSync(fmiPath, "utf8");
+          const imIdx = fmiSource.indexOf("const INSTALLABLE_MODULES = {");
+          const imOpen = fmiSource.indexOf("{", imIdx);
+          const imClose = findMatchingBrace(fmiSource, imOpen);
+          const imLiteral = fmiSource.slice(imOpen, imClose + 1);
+          const INSTALLABLE_MODULES = Function(`"use strict"; return (${imLiteral});`)();
+          const shelfMeta = INSTALLABLE_MODULES[moduleId];
+
+          const mismatches = [];
+          if (!shelfMeta) {
+            mismatches.push(`- Module \`${moduleId}\` is not present in \`INSTALLABLE_MODULES\`.`);
+          } else {
+            const compareKeys = [
+              "title",
+              "description",
+              "compatibility",
+              "esmodules",
+              "styles",
+              "languages",
+              "packs",
+              "packFolders",
+              "relationships",
+              "socket",
+              "bugs"
+            ];
+            for (const key of compareKeys) {
+              const a = callerManifest[key] ?? null;
+              const b = shelfMeta[key] ?? null;
+              if (JSON.stringify(a) !== JSON.stringify(b)) {
+                mismatches.push(
+                  `- **\`${key}\`**:\n  - \`module.json\`: \`${JSON.stringify(a)}\`\n  - \`INSTALLABLE_MODULES\`: \`${JSON.stringify(b)}\``
+                );
+              }
+            }
+          }
+
+          let reportMd = "";
+          if (mismatches.length === 0) {
+            reportMd = "No metadata mismatches detected between `module.json` and `INSTALLABLE_MODULES` in `foundryModuleInstall.js`.";
+          } else {
+            reportMd = [
+              `> [!WARNING]`,
+              `> Static metadata in \`ionrift-cloud/middleware/src/foundryModuleInstall.js\` (\`INSTALLABLE_MODULES["${moduleId}"]\`) differs from \`module.json\` (flagged for human review; not auto-edited):`,
+              "",
+              ...mismatches
+            ].join("\n");
+          }
+          fs.writeFileSync("/tmp/installable-modules-report.md", reportMd + "\n", "utf8");
+          EOF
+
+          node ionrift-pack-registry/scripts/validate-registry-alignment.mjs
+          node ionrift-cloud/middleware/scripts/check-bundle-artifacts.mjs --registry ionrift-pack-registry/registry.json
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GCS_PATH: ${{ steps.validate.outputs.gcs_path }}
+          UPLOAD_GCS: ${{ inputs.upload_gcs && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Module Shelf Publish (Dry Run)"
+            echo ""
+            echo "- **Module:** \`${MODULE_ID}\`"
+            echo "- **Version:** \`${VERSION}\`"
+            echo "- **Dry Run:** \`true\` (no GCS upload, no PRs opened, no Cloud Run deploy)"
+            if [ "$UPLOAD_GCS" = "true" ]; then
+              echo "- **Planned GCS Object:** \`gs://ionrift-packs-prod/${GCS_PATH}\`"
+            else
+              echo "- **Planned GCS Object:** *(skipped, \`upload_gcs: false\`)*"
+            fi
+            echo ""
+            echo "### \`INSTALLABLE_MODULES\` Check (\`foundryModuleInstall.js\`)"
+            echo ""
+            cat /tmp/installable-modules-report.md
+            echo ""
+            echo "### Planned Diff: \`ionrift-cloud\` (\`middleware/src/packs.js\`)"
+            echo ""
+            echo '```diff'
+            git -C ionrift-cloud diff middleware/src/packs.js
+            echo '```'
+            echo ""
+            echo "### Planned Diff: \`ionrift-pack-registry\` (\`registry.json\` & \`ci/pack-catalog-snapshot.json\`)"
+            echo ""
+            echo '```diff'
+            git -C ionrift-pack-registry diff registry.json ci/pack-catalog-snapshot.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Authenticate to Google Cloud
+        if: ${{ !inputs.dry_run && inputs.upload_gcs }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_PROD }}
+
+      - name: Set up gcloud
+        if: ${{ !inputs.dry_run && inputs.upload_gcs }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload module zip to GCS
+        if: ${{ !inputs.dry_run && inputs.upload_gcs }}
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GCS_PATH: ${{ steps.validate.outputs.gcs_path }}
+        run: |
+          set -euo pipefail
+          DEST="gs://ionrift-packs-prod/${GCS_PATH}"
+          if gsutil -q stat "$DEST"; then
+            echo "GCS object already exists: $DEST (skipping upload)"
+          else
+            gsutil -o "GSUtil:default_project_id=ionrift-tokens-prod" cp "/tmp/${MODULE_ID}-${VERSION}.zip" "$DEST"
+            echo "Uploaded $DEST"
+          fi
+
+      - name: Open PR in ionrift-cloud
+        if: ${{ !inputs.dry_run }}
+        id: cloud_pr
+        working-directory: ionrift-cloud
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GCS_PATH: ${{ steps.validate.outputs.gcs_path }}
+          GH_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/${MODULE_ID}-${VERSION}"
+          git config user.name "ionriftgm"
+          git config user.email "ionrift.gm@gmail.com"
+          git checkout -B "$BRANCH"
+          git add middleware/src/packs.js
+          if git diff --cached --quiet; then
+            echo "No changes in middleware/src/packs.js"
+            echo "pr_url=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit --author="ionriftgm <ionrift.gm@gmail.com>" \
+            -m "Bump ${MODULE_ID} catalog to ${VERSION}"
+          git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}"
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "Automated Module Shelf catalog update for \`${MODULE_ID}\` \`${VERSION}\`."
+            echo ""
+            echo "- **GCS Object:** \`gs://ionrift-packs-prod/${GCS_PATH}\`"
+            echo ""
+            echo "### \`INSTALLABLE_MODULES\` Check (\`foundryModuleInstall.js\`)"
+            echo ""
+            cat /tmp/installable-modules-report.md
+          } > "$BODY_FILE"
+
+          EXISTING_PR="$(gh pr list --repo ionrift-gm/ionrift-cloud --head "$BRANCH" --base main --json url --jq '.[0].url // empty')"
+          if [ -n "$EXISTING_PR" ]; then
+            PR_URL="$EXISTING_PR"
+          else
+            PR_URL="$(gh pr create \
+              --repo ionrift-gm/ionrift-cloud \
+              --base main \
+              --head "$BRANCH" \
+              --title "Bump ${MODULE_ID} catalog to ${VERSION}" \
+              --body-file "$BODY_FILE")"
+          fi
+          rm -f "$BODY_FILE"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "Opened/updated ionrift-cloud PR: ${PR_URL}"
+
+      - name: Open PR in ionrift-pack-registry
+        if: ${{ !inputs.dry_run }}
+        id: registry_pr
+        working-directory: ionrift-pack-registry
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GH_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/${MODULE_ID}-${VERSION}"
+          git config user.name "ionriftgm"
+          git config user.email "ionrift.gm@gmail.com"
+          git checkout -B "$BRANCH"
+          git add registry.json ci/pack-catalog-snapshot.json
+          if git diff --cached --quiet; then
+            echo "No changes in registry.json or ci/pack-catalog-snapshot.json"
+            echo "pr_url=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit --author="ionriftgm <ionrift.gm@gmail.com>" \
+            -m "Bump ${MODULE_ID} registry to ${VERSION}"
+          git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}"
+
+          EXISTING_PR="$(gh pr list --repo ionrift-gm/ionrift-pack-registry --head "$BRANCH" --base main --json url --jq '.[0].url // empty')"
+          if [ -n "$EXISTING_PR" ]; then
+            PR_URL="$EXISTING_PR"
+          else
+            PR_URL="$(gh pr create \
+              --repo ionrift-gm/ionrift-pack-registry \
+              --base main \
+              --head "$BRANCH" \
+              --title "Bump ${MODULE_ID} registry to ${VERSION}" \
+              --body "Automated Module Shelf registry and catalog snapshot update for \`${MODULE_ID}\` \`${VERSION}\`.")"
+          fi
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "Opened/updated ionrift-pack-registry PR: ${PR_URL}"
+
+      - name: Deploy middleware (prod)
+        if: ${{ !inputs.dry_run && inputs.deploy_middleware }}
+        working-directory: ionrift-cloud
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud config get-value project
+          gcloud run deploy generate-token-v3 \
+            --source middleware \
+            --region us-central1 \
+            --project ionrift-tokens-prod \
+            --quiet
+
+      - name: Write live job summary
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          MODULE_ID: ${{ inputs.module_id }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          GCS_PATH: ${{ steps.validate.outputs.gcs_path }}
+          CLOUD_PR: ${{ steps.cloud_pr.outputs.pr_url }}
+          REGISTRY_PR: ${{ steps.registry_pr.outputs.pr_url }}
+          DEPLOY_MW: ${{ inputs.deploy_middleware && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Module Shelf Publish"
+            echo ""
+            echo "- **Module:** \`${MODULE_ID}\`"
+            echo "- **Version:** \`${VERSION}\`"
+            echo "- **GCS Object:** \`gs://ionrift-packs-prod/${GCS_PATH}\`"
+            echo "- **ionrift-cloud PR:** ${CLOUD_PR}"
+            echo "- **ionrift-pack-registry PR:** ${REGISTRY_PR}"
+            echo "- **Middleware Deploy Requested:** \`${DEPLOY_MW}\`"
+            echo ""
+            echo "### \`INSTALLABLE_MODULES\` Check (\`foundryModuleInstall.js\`)"
+            echo ""
+            cat /tmp/installable-modules-report.md
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -24,7 +24,8 @@ jobs:
       - name: Compare GitHub releases against registry.json and /packs/status
         shell: bash
         env:
-          READ_TOKEN: ${{ secrets.IONRIFT_CI_PAT || github.token }}
+          READ_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN || secrets.IONRIFT_CI_PAT || github.token }}
+          HAS_CROSS_REPO_TOKEN: ${{ secrets.IONRIFTGM_GIT_TOKEN != '' || secrets.IONRIFT_CI_PAT != '' }}
         run: |
           set -euo pipefail
           node - <<'EOF'
@@ -34,6 +35,7 @@ jobs:
           const cfgPath = path.resolve("config/shelf-modules.json");
           const { modules } = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
           const token = (process.env.READ_TOKEN || "").trim();
+          const hasCrossRepoToken = String(process.env.HAS_CROSS_REPO_TOKEN || "").trim() === "true";
 
           const STATUS_URL = "https://api.ionrift.cloud/packs/status";
           const REGISTRY_URL = "https://raw.githubusercontent.com/ionrift-gm/ionrift-pack-registry/main/registry.json";
@@ -62,17 +64,25 @@ jobs:
               }
             });
             if (!res.ok) {
-              return { ok: false, version: `error (HTTP ${res.status})` };
+              if (res.status === 404 && !hasCrossRepoToken) {
+                return {
+                  ok: false,
+                  skipped: true,
+                  version: "pending cross-repo token"
+                };
+              }
+              return { ok: false, skipped: false, version: `error (HTTP ${res.status})` };
             }
             const list = await res.json();
             const rel = Array.isArray(list)
               ? list.find((r) => r && !r.draft && typeof r.tag_name === "string" && r.tag_name.length > 0)
               : null;
             if (!rel) {
-              return { ok: false, version: "none" };
+              return { ok: false, skipped: false, version: "none" };
             }
             return {
               ok: true,
+              skipped: false,
               tag: rel.tag_name,
               version: rel.tag_name.replace(/^v/, "")
             };
@@ -87,6 +97,7 @@ jobs:
 
             const rows = [];
             let drifted = false;
+            let skippedPrivate = false;
 
             for (const mod of modules) {
               const gh = await fetchLatestRelease(mod.repo);
@@ -94,7 +105,12 @@ jobs:
               const regLatest = regEntry.earlyAccess?.version || regEntry.latest || "missing";
               const apiLatest = statusMap.get(mod.id) || "missing";
 
-              const aligned = gh.ok && gh.version === regLatest && gh.version === apiLatest;
+              const shelfAligned = regLatest !== "missing" && regLatest === apiLatest;
+              const aligned = gh.skipped
+                ? shelfAligned
+                : gh.ok && gh.version === regLatest && gh.version === apiLatest;
+
+              if (gh.skipped) skippedPrivate = true;
               if (!aligned) drifted = true;
 
               rows.push({
@@ -102,7 +118,7 @@ jobs:
                 github: gh.ok ? `${gh.version} (${gh.tag})` : gh.version,
                 registry: regLatest,
                 statusApi: apiLatest,
-                state: aligned ? "OK" : "DRIFT"
+                state: !aligned ? "DRIFT" : gh.skipped ? "OK (Shelf aligned)" : "OK"
               });
             }
 
@@ -121,8 +137,12 @@ jobs:
               fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report + "\n", "utf8");
             }
 
+            if (skippedPrivate) {
+              console.warn("::warning::Private module release tags were skipped because the cross-repo token secret is not configured yet; verified registry.json matches live /packs/status.");
+            }
+
             if (drifted) {
-              console.error("::error::One or more Shelf-delivered modules are out of sync with their latest GitHub release.");
+              console.error("::error::One or more Shelf-delivered modules are out of sync.");
               process.exit(1);
             }
           })().catch((err) => {
